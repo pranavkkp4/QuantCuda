@@ -38,7 +38,7 @@ __device__ __forceinline__ bool breached(int dir, double price, double barrier) 
 template <typename Real, typename AccT>
 __global__ void barrier_early_exit_kernel(dev::OptionParams opt,
                                           curandStatePhilox4_32_10_t* states,
-                                          double* block_sums, double* block_sq_sums,
+                                          dev::MomentPartial* block_moments,
                                           unsigned long long* knockout_count,
                                           std::size_t path_count) {
     int steps = opt.time_steps;
@@ -50,7 +50,7 @@ __global__ void barrier_early_exit_kernel(dev::OptionParams opt,
     Real k = static_cast<Real>(opt.strike);
     Real b = static_cast<Real>(opt.barrier);
 
-    AccT sum = AccT(0), sq = AccT(0);
+    dev::RunningMoments<AccT> moments;
     unsigned long long local_ko = 0;
     std::size_t stride = dev::grid_stride();
     for (std::size_t i = dev::global_thread_id(); i < path_count; i += stride) {
@@ -66,30 +66,25 @@ __global__ void barrier_early_exit_kernel(dev::OptionParams opt,
         }
         if (!alive) {
             ++local_ko;
+            dev::moments_add(moments, AccT(0));
             continue;
         }
         AccT p = static_cast<AccT>(opt.is_call ? fmax(s - k, Real(0))
                                                : fmax(k - s, Real(0)));
-        sum += p;
-        sq += p * p;
+        dev::moments_add(moments, p);
     }
     if (knockout_count && local_ko) atomicAdd(knockout_count, local_ko);
     extern __shared__ char smem_raw[];
-    AccT* red = reinterpret_cast<AccT*>(smem_raw);
-    AccT total_sum = dev::block_reduce_warp(sum, red);
-    __syncthreads();
-    AccT total_sq = dev::block_reduce_warp(sq, red);
-    if (threadIdx.x == 0) {
-        block_sums[blockIdx.x] = static_cast<double>(total_sum);
-        block_sq_sums[blockIdx.x] = static_cast<double>(total_sq);
-    }
+    auto* red = reinterpret_cast<dev::RunningMoments<AccT>*>(smem_raw);
+    const auto total = dev::block_reduce_moments_warp(moments, red);
+    if (threadIdx.x == 0) block_moments[blockIdx.x] = dev::moments_partial(total);
 }
 
 // ---------------- mode 1: boolean alive mask ---------------------------------
 template <typename Real, typename AccT>
 __global__ void barrier_mask_kernel(dev::OptionParams opt,
                                     curandStatePhilox4_32_10_t* states,
-                                    double* block_sums, double* block_sq_sums,
+                                    dev::MomentPartial* block_moments,
                                     unsigned long long* knockout_count,
                                     std::size_t path_count) {
     int steps = opt.time_steps;
@@ -101,7 +96,7 @@ __global__ void barrier_mask_kernel(dev::OptionParams opt,
     Real k = static_cast<Real>(opt.strike);
     Real b = static_cast<Real>(opt.barrier);
 
-    AccT sum = AccT(0), sq = AccT(0);
+    dev::RunningMoments<AccT> moments;
     unsigned long long local_ko = 0;
     std::size_t stride = dev::grid_stride();
     for (std::size_t i = dev::global_thread_id(); i < path_count; i += stride) {
@@ -116,19 +111,13 @@ __global__ void barrier_mask_kernel(dev::OptionParams opt,
         AccT p = alive ? static_cast<AccT>(opt.is_call ? fmax(s - k, Real(0))
                                                        : fmax(k - s, Real(0)))
                        : AccT(0);
-        sum += p;
-        sq += p * p;
+        dev::moments_add(moments, p);
     }
     if (knockout_count && local_ko) atomicAdd(knockout_count, local_ko);
     extern __shared__ char smem_raw[];
-    AccT* red = reinterpret_cast<AccT*>(smem_raw);
-    AccT total_sum = dev::block_reduce_warp(sum, red);
-    __syncthreads();
-    AccT total_sq = dev::block_reduce_warp(sq, red);
-    if (threadIdx.x == 0) {
-        block_sums[blockIdx.x] = static_cast<double>(total_sum);
-        block_sq_sums[blockIdx.x] = static_cast<double>(total_sq);
-    }
+    auto* red = reinterpret_cast<dev::RunningMoments<AccT>*>(smem_raw);
+    const auto total = dev::block_reduce_moments_warp(moments, red);
+    if (threadIdx.x == 0) block_moments[blockIdx.x] = dev::moments_partial(total);
 }
 
 // ---------------- mode 2: two-phase stream compaction -------------------------
@@ -168,8 +157,8 @@ __global__ void barrier_phase2_kernel(dev::OptionParams opt,
                                       std::size_t survivor_count,
                                       const double* path_prices,
                                       curandStatePhilox4_32_10_t* states,
-                                      int half_steps, double* block_sums,
-                                      double* block_sq_sums,
+                                      int half_steps,
+                                      dev::MomentPartial* block_moments,
                                       unsigned long long* knockout_count) {
     int steps = opt.time_steps;
     double dt = opt.maturity / static_cast<double>(steps);
@@ -177,7 +166,7 @@ __global__ void barrier_phase2_kernel(dev::OptionParams opt,
     double diff = dev::gbm_diffusion<double>(opt.volatility, dt);
     double k = opt.strike;
     double b = opt.barrier;
-    double sum = 0.0, sq = 0.0;
+    dev::RunningMoments<double> moments;
     unsigned long long local_ko = 0;
     std::size_t stride = dev::grid_stride();
     for (std::size_t t = dev::global_thread_id(); t < survivor_count; t += stride) {
@@ -191,18 +180,13 @@ __global__ void barrier_phase2_kernel(dev::OptionParams opt,
         }
         if (!alive) ++local_ko;
         double p = alive ? (opt.is_call ? fmax(s - k, 0.0) : fmax(k - s, 0.0)) : 0.0;
-        sum += p;
-        sq += p * p;
+        dev::moments_add(moments, p);
     }
     if (local_ko) atomicAdd(knockout_count, local_ko);
-    extern __shared__ double red[];
-    double total_sum = dev::block_reduce_warp(sum, red);
-    __syncthreads();
-    double total_sq = dev::block_reduce_warp(sq, red);
-    if (threadIdx.x == 0) {
-        block_sums[blockIdx.x] = total_sum;
-        block_sq_sums[blockIdx.x] = total_sq;
-    }
+    extern __shared__ char smem_raw[];
+    auto* red = reinterpret_cast<dev::RunningMoments<double>*>(smem_raw);
+    const auto total = dev::block_reduce_moments_warp(moments, red);
+    if (threadIdx.x == 0) block_moments[blockIdx.x] = dev::moments_partial(total);
 }
 
 struct IsAlive {
@@ -216,31 +200,26 @@ GpuMcRun run_branchy(const dev::OptionParams& opt, std::size_t paths,
     if (paths == 0) return GpuMcRun{};
     DeviceBuffer<curandStatePhilox4_32_10_t> states(paths);
     int grid = dev::grid_for(paths, block_size);
-    DeviceBuffer<double> sums(static_cast<std::size_t>(grid));
-    DeviceBuffer<double> sqs(static_cast<std::size_t>(grid));
+    DeviceBuffer<dev::MomentPartial> moments(static_cast<std::size_t>(grid));
     DeviceBuffer<unsigned long long> ko(1);
     QC_CUDA_CHECK(cudaMemset(ko.ptr, 0, sizeof(unsigned long long)));
     init_rng(states.ptr, seed, paths, block_size, nullptr);
     QC_CUDA_CHECK(cudaDeviceSynchronize());
 
     EventTimer ev;
-    std::size_t smem = static_cast<std::size_t>(block_size) * sizeof(double);
-    if (smem < 32 * sizeof(double)) smem = 32 * sizeof(double);
+    std::size_t smem = 32 * sizeof(dev::RunningMoments<AccT>);
     ev.begin();
-    kernel<<<grid, block_size, smem>>>(opt, states.ptr, sums.ptr, sqs.ptr, ko.ptr,
-                                       paths);
+    kernel<<<grid, block_size, smem>>>(opt, states.ptr, moments.ptr, ko.ptr, paths);
     QC_CUDA_CHECK(cudaGetLastError());
     float kernel_ms = ev.end();
 
-    std::vector<double> h_sums(static_cast<std::size_t>(grid));
-    std::vector<double> h_sqs(static_cast<std::size_t>(grid));
-    sums.copy_to(h_sums.data());
-    sqs.copy_to(h_sqs.data());
+    std::vector<dev::MomentPartial> h_moments(static_cast<std::size_t>(grid));
+    moments.copy_to(h_moments.data());
     unsigned long long h_ko = 0;
     QC_CUDA_CHECK(cudaMemcpy(&h_ko, ko.ptr, sizeof(h_ko), cudaMemcpyDeviceToHost));
     QC_CUDA_CHECK(cudaDeviceSynchronize());
     GpuMcRun out;
-    out.stats = finalize_partials(h_sums, h_sqs, paths, exp(-opt.rate * opt.maturity));
+    out.stats = finalize_partials(h_moments, paths, exp(-opt.rate * opt.maturity));
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
     out.extra = paths ? static_cast<double>(h_ko) / static_cast<double>(paths) : 0.0;
@@ -258,11 +237,10 @@ GpuMcRun run_compacted(const dev::OptionParams& opt, std::size_t paths,
     DeviceBuffer<int> survivors(paths);
     DeviceBuffer<int> ids(paths);
     DeviceBuffer<curandStatePhilox4_32_10_t> states(paths);
-    DeviceBuffer<double> sums(static_cast<std::size_t>(grid));
-    DeviceBuffer<double> sqs(static_cast<std::size_t>(grid));
+    DeviceBuffer<dev::MomentPartial> moments(static_cast<std::size_t>(grid));
     DeviceBuffer<unsigned long long> ko(1);
-    QC_CUDA_CHECK(cudaMemset(sums.ptr, 0, sums.n * sizeof(double)));
-    QC_CUDA_CHECK(cudaMemset(sqs.ptr, 0, sqs.n * sizeof(double)));
+    QC_CUDA_CHECK(cudaMemset(moments.ptr, 0,
+                             moments.n * sizeof(dev::MomentPartial)));
     QC_CUDA_CHECK(cudaMemset(ko.ptr, 0, sizeof(unsigned long long)));
     init_rng(states.ptr, seed, paths, block_size, nullptr);
 
@@ -278,25 +256,24 @@ GpuMcRun run_compacted(const dev::OptionParams& opt, std::size_t paths,
     std::size_t survivor_count = static_cast<std::size_t>(end - survivors.ptr);
 
     if (survivor_count > 0) {
-        std::size_t smem = static_cast<std::size_t>(block_size) * sizeof(double);
-        if (smem < 32 * sizeof(double)) smem = 32 * sizeof(double);
+        std::size_t smem = 32 * sizeof(dev::RunningMoments<double>);
         int survivor_grid = dev::grid_for(survivor_count, block_size);
         barrier_phase2_kernel<<<survivor_grid, block_size, smem>>>(
             opt, survivors.ptr, survivor_count, path_prices.ptr, states.ptr, half,
-            sums.ptr, sqs.ptr, ko.ptr);
+            moments.ptr, ko.ptr);
     }
     QC_CUDA_CHECK(cudaGetLastError());
     float kernel_ms = ev.end();
 
-    std::vector<double> h_sums(static_cast<std::size_t>(grid));
-    std::vector<double> h_sqs(static_cast<std::size_t>(grid));
-    sums.copy_to(h_sums.data());
-    sqs.copy_to(h_sqs.data());
+    std::vector<dev::MomentPartial> h_moments(static_cast<std::size_t>(grid));
+    moments.copy_to(h_moments.data());
     unsigned long long h_ko = 0;
     QC_CUDA_CHECK(cudaMemcpy(&h_ko, ko.ptr, sizeof(h_ko), cudaMemcpyDeviceToHost));
     QC_CUDA_CHECK(cudaDeviceSynchronize());
     GpuMcRun out;
-    out.stats = finalize_partials(h_sums, h_sqs, paths, exp(-opt.rate * opt.maturity));
+    out.stats = finalize_partials(h_moments, paths,
+                                  exp(-opt.rate * opt.maturity),
+                                  /*allow_implicit_zeros=*/true);
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
     out.extra = static_cast<double>(h_ko) / static_cast<double>(paths);

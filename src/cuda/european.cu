@@ -11,6 +11,7 @@
 //   V7 precision : float / double / mixed (float sim, double accumulation)
 #include "cuda_internal.cuh"
 #include "cuda_utils.cuh"
+#include "quantcuda/black_scholes.hpp"
 
 #include <type_traits>
 
@@ -30,6 +31,22 @@ __device__ float draw_normal<float>(curandStatePhilox4_32_10_t* s) {
 template <>
 __device__ double draw_normal<double>(curandStatePhilox4_32_10_t* s) {
     return curand_normal_double(s);
+}
+
+// Exact expected undiscounted payoff for the European model. V0/V1 subtract
+// this control center before their defining global atomic reductions, keeping
+// shifted moments well conditioned even when deterministic carry moves a very
+// large payoff far from its spot intrinsic value.
+double payoff_center(const dev::OptionParams& opt) {
+    const OptionType type = opt.is_call ? OptionType::EuropeanCall
+                                        : OptionType::EuropeanPut;
+    const double discounted = BlackScholesPricer::price(
+        type, opt.spot, opt.strike, opt.rate, opt.dividend, opt.volatility,
+        opt.maturity);
+    const double center = discounted * std::exp(opt.rate * opt.maturity);
+    if (std::isfinite(center)) return center;
+    return opt.is_call ? std::fmax(opt.spot - opt.strike, 0.0)
+                       : std::fmax(opt.strike - opt.spot, 0.0);
 }
 
 // ===========================================================================
@@ -70,12 +87,13 @@ __global__ void v0_payoff_kernel(const dev::OptionAoS* options,
 // this is the baseline the optimized reductions are measured against).
 template <typename Real>
 __global__ void v0_atomic_reduce_kernel(const Real* payoffs, std::size_t path_count,
-                                        double* sum, double* sq_sum) {
+                                        double center, double* shifted_sum,
+                                        double* shifted_sq_sum) {
     const std::size_t stride = dev::grid_stride();
     for (std::size_t i = dev::global_thread_id(); i < path_count; i += stride) {
-        double p = static_cast<double>(payoffs[i]);
-        atomicAdd(sum, p);
-        atomicAdd(sq_sum, p * p);
+        const double shifted = static_cast<double>(payoffs[i]) - center;
+        atomicAdd(shifted_sum, shifted);
+        atomicAdd(shifted_sq_sum, shifted * shifted);
     }
 }
 
@@ -85,6 +103,7 @@ __global__ void v0_atomic_reduce_kernel(const Real* payoffs, std::size_t path_co
 template <typename Real, bool UseAoS>
 __global__ void v1_batch_kernel(const void* params, /*SoA ptr or AoS ptr*/
                                 int option_count, std::size_t paths_each,
+                                const double* payoff_centers,
                                 curandStatePhilox4_32_10_t* states,
                                 double* option_sums, double* option_sq_sums) {
     const std::size_t total = static_cast<std::size_t>(option_count) * paths_each;
@@ -123,10 +142,11 @@ __global__ void v1_batch_kernel(const void* params, /*SoA ptr or AoS ptr*/
         curandStatePhilox4_32_10_t state = states[idx];
         Real z = draw_normal<Real>(&state);
         Real st = static_cast<Real>(opt.spot) * exp(drift + diff * z);
-        double p = static_cast<double>(
+        const double p = static_cast<double>(
             dev::european_payoff_d<Real>(opt.is_call, st, static_cast<Real>(opt.strike)));
-        atomicAdd(option_sums + instrument, p);
-        atomicAdd(option_sq_sums + instrument, p * p);
+        const double shifted = p - payoff_centers[instrument];
+        atomicAdd(option_sums + instrument, shifted);
+        atomicAdd(option_sq_sums + instrument, shifted * shifted);
     }
 }
 
@@ -137,7 +157,7 @@ __global__ void v1_batch_kernel(const void* params, /*SoA ptr or AoS ptr*/
 template <typename Real, typename AccT, int ReduceFlavor>
 __global__ void european_fused_kernel(dev::OptionParams opt,
                                       curandStatePhilox4_32_10_t* states,
-                                      double* block_sums, double* block_sq_sums,
+                                      dev::MomentPartial* block_moments,
                                       std::size_t path_count) {
     Real drift = dev::gbm_drift<Real>(static_cast<Real>(opt.rate),
                                       static_cast<Real>(opt.dividend),
@@ -145,7 +165,7 @@ __global__ void european_fused_kernel(dev::OptionParams opt,
                                       static_cast<Real>(opt.maturity));
     Real diff = dev::gbm_diffusion<Real>(static_cast<Real>(opt.volatility),
                                          static_cast<Real>(opt.maturity));
-    AccT sum = AccT(0), sq = AccT(0);
+    dev::RunningMoments<AccT> moments;
     std::size_t stride = dev::grid_stride();
     for (std::size_t i = dev::global_thread_id(); i < path_count; i += stride) {
         curandStatePhilox4_32_10_t state = states[i];
@@ -153,26 +173,18 @@ __global__ void european_fused_kernel(dev::OptionParams opt,
         Real st = static_cast<Real>(opt.spot) * exp(drift + diff * z);
         AccT p = static_cast<AccT>(
             dev::european_payoff_d<Real>(opt.is_call, st, static_cast<Real>(opt.strike)));
-        sum += p;
-        sq += p * p;
+        dev::moments_add(moments, p);
     }
 
     extern __shared__ char smem_raw[];
-    AccT* red = reinterpret_cast<AccT*>(smem_raw);
-    AccT total_sum, total_sq;
+    auto* red = reinterpret_cast<dev::RunningMoments<AccT>*>(smem_raw);
+    dev::RunningMoments<AccT> total;
     if constexpr (ReduceFlavor == 1) {
-        total_sum = dev::block_reduce_smem(sum, red);
-        __syncthreads();
-        total_sq = dev::block_reduce_smem(sq, red);
+        total = dev::block_reduce_moments_smem(moments, red);
     } else {
-        total_sum = dev::block_reduce_warp(sum, red);
-        __syncthreads();
-        total_sq = dev::block_reduce_warp(sq, red);
+        total = dev::block_reduce_moments_warp(moments, red);
     }
-    if (threadIdx.x == 0) {
-        block_sums[blockIdx.x] = static_cast<double>(total_sum);
-        block_sq_sums[blockIdx.x] = static_cast<double>(total_sq);
-    }
+    if (threadIdx.x == 0) block_moments[blockIdx.x] = dev::moments_partial(total);
 }
 
 // ===========================================================================
@@ -182,8 +194,7 @@ __constant__ dev::OptionParams c_opt_params;
 
 template <typename Real, typename AccT>
 __global__ void european_fused_constmem_kernel(curandStatePhilox4_32_10_t* states,
-                                               double* block_sums,
-                                               double* block_sq_sums,
+                                               dev::MomentPartial* block_moments,
                                                std::size_t path_count) {
     Real drift = dev::gbm_drift<Real>(static_cast<Real>(c_opt_params.rate),
                                       static_cast<Real>(c_opt_params.dividend),
@@ -191,7 +202,7 @@ __global__ void european_fused_constmem_kernel(curandStatePhilox4_32_10_t* state
                                       static_cast<Real>(c_opt_params.maturity));
     Real diff = dev::gbm_diffusion<Real>(static_cast<Real>(c_opt_params.volatility),
                                          static_cast<Real>(c_opt_params.maturity));
-    AccT sum = AccT(0), sq = AccT(0);
+    dev::RunningMoments<AccT> moments;
     std::size_t stride = dev::grid_stride();
     for (std::size_t i = dev::global_thread_id(); i < path_count; i += stride) {
         curandStatePhilox4_32_10_t state = states[i];
@@ -199,18 +210,12 @@ __global__ void european_fused_constmem_kernel(curandStatePhilox4_32_10_t* state
         Real st = static_cast<Real>(c_opt_params.spot) * exp(drift + diff * z);
         AccT p = static_cast<AccT>(dev::european_payoff_d<Real>(
             c_opt_params.is_call, st, static_cast<Real>(c_opt_params.strike)));
-        sum += p;
-        sq += p * p;
+        dev::moments_add(moments, p);
     }
     extern __shared__ char smem_raw[];
-    AccT* red = reinterpret_cast<AccT*>(smem_raw);
-    AccT total_sum = dev::block_reduce_warp(sum, red);
-    __syncthreads();
-    AccT total_sq = dev::block_reduce_warp(sq, red);
-    if (threadIdx.x == 0) {
-        block_sums[blockIdx.x] = static_cast<double>(total_sum);
-        block_sq_sums[blockIdx.x] = static_cast<double>(total_sq);
-    }
+    auto* red = reinterpret_cast<dev::RunningMoments<AccT>*>(smem_raw);
+    const auto total = dev::block_reduce_moments_warp(moments, red);
+    if (threadIdx.x == 0) block_moments[blockIdx.x] = dev::moments_partial(total);
 }
 
 // ---------------------------------------------------------------------------
@@ -224,8 +229,7 @@ GpuMcRun run_fused(const dev::OptionParams& opt, std::size_t paths,
     if (paths == 0) return GpuMcRun{};
     DeviceBuffer<curandStatePhilox4_32_10_t> states(paths);
     int grid = dev::grid_for(paths, block_size);
-    DeviceBuffer<double> sums(static_cast<std::size_t>(grid));
-    DeviceBuffer<double> sqs(static_cast<std::size_t>(grid));
+    DeviceBuffer<dev::MomentPartial> moments(static_cast<std::size_t>(grid));
 
     init_rng(states.ptr, seed, paths, block_size, nullptr);
     QC_CUDA_CHECK(cudaDeviceSynchronize());
@@ -235,30 +239,31 @@ GpuMcRun run_fused(const dev::OptionParams& opt, std::size_t paths,
         QC_CUDA_CHECK(cudaMemcpyToSymbol(c_opt_params, &opt, sizeof(opt)));
 
     EventTimer ev;
-    std::size_t smem = static_cast<std::size_t>(block_size) * sizeof(double);
-    if (smem < 32 * sizeof(double)) smem = 32 * sizeof(double);
+    const std::size_t moment_slots =
+        (!use_constant_memory && flavor == 1)
+            ? static_cast<std::size_t>(block_size)
+            : std::size_t{32};
+    std::size_t smem = moment_slots * sizeof(dev::RunningMoments<AccT>);
     ev.begin();
     if (use_constant_memory) {
         european_fused_constmem_kernel<Real, AccT>
-            <<<grid, block_size, smem>>>(states.ptr, sums.ptr, sqs.ptr, paths);
+            <<<grid, block_size, smem>>>(states.ptr, moments.ptr, paths);
     } else if (flavor == 1) {
         european_fused_kernel<Real, AccT, 1>
-            <<<grid, block_size, smem>>>(opt, states.ptr, sums.ptr, sqs.ptr, paths);
+            <<<grid, block_size, smem>>>(opt, states.ptr, moments.ptr, paths);
     } else {
         european_fused_kernel<Real, AccT, 3>
-            <<<grid, block_size, smem>>>(opt, states.ptr, sums.ptr, sqs.ptr, paths);
+            <<<grid, block_size, smem>>>(opt, states.ptr, moments.ptr, paths);
     }
     QC_CUDA_CHECK(cudaGetLastError());
     float kernel_ms = ev.end();
 
-    std::vector<double> h_sums(static_cast<std::size_t>(grid));
-    std::vector<double> h_sqs(static_cast<std::size_t>(grid));
-    sums.copy_to(h_sums.data());
-    sqs.copy_to(h_sqs.data());
+    std::vector<dev::MomentPartial> h_moments(static_cast<std::size_t>(grid));
+    moments.copy_to(h_moments.data());
     QC_CUDA_CHECK(cudaDeviceSynchronize());
 
     GpuMcRun out;
-    out.stats = finalize_partials(h_sums, h_sqs, paths, exp(-opt.rate * opt.maturity));
+    out.stats = finalize_partials(h_moments, paths, exp(-opt.rate * opt.maturity));
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
     return out;
@@ -292,8 +297,9 @@ GpuMcRun run_v0(const dev::OptionParams& opt, std::size_t paths, std::uint64_t s
                                                             terminal.ptr, paths);
     v0_payoff_kernel<Real><<<grid, block_size>>>(options.ptr, terminal.ptr,
                                                  payoffs.ptr, paths);
-    v0_atomic_reduce_kernel<Real><<<grid, block_size>>>(payoffs.ptr, paths, acc.ptr,
-                                                        acc.ptr + 1);
+    const double center = payoff_center(opt);
+    v0_atomic_reduce_kernel<Real><<<grid, block_size>>>(
+        payoffs.ptr, paths, center, acc.ptr, acc.ptr + 1);
     QC_CUDA_CHECK(cudaGetLastError());
     float kernel_ms = ev.end();
 
@@ -301,7 +307,7 @@ GpuMcRun run_v0(const dev::OptionParams& opt, std::size_t paths, std::uint64_t s
     QC_CUDA_CHECK(cudaMemcpy(h_acc, acc.ptr, sizeof(h_acc), cudaMemcpyDeviceToHost));
     GpuMcRun out;
     double df = exp(-opt.rate * opt.maturity);
-    out.stats = finalize_sums(h_acc[0], h_acc[1], paths, df);
+    out.stats = finalize_shifted_sums(h_acc[0], h_acc[1], center, paths, df);
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
     return out;
@@ -369,13 +375,9 @@ GpuMcRun european_async_gpu(const dev::OptionParams& opt, std::size_t paths,
                         static_cast<std::size_t>(n_streams);
 
     // Pinned host buffers for async transfers.
-    double* h_sums = nullptr;
-    double* h_sqs = nullptr;
-    QC_CUDA_CHECK(cudaHostAlloc(&h_sums, static_cast<std::size_t>(n_streams) *
-                                             65536 * sizeof(double),
-                                cudaHostAllocDefault));
-    QC_CUDA_CHECK(cudaHostAlloc(&h_sqs, static_cast<std::size_t>(n_streams) *
-                                            65536 * sizeof(double),
+    dev::MomentPartial* h_moments = nullptr;
+    QC_CUDA_CHECK(cudaHostAlloc(&h_moments, static_cast<std::size_t>(n_streams) *
+                                            65536 * sizeof(dev::MomentPartial),
                                 cudaHostAllocDefault));
 
     std::vector<cudaStream_t> streams(static_cast<std::size_t>(n_streams));
@@ -386,68 +388,62 @@ GpuMcRun european_async_gpu(const dev::OptionParams& opt, std::size_t paths,
 
     EventTimer ev;
     ev.begin();
-    DeviceBuffer<double> d_sums(static_cast<std::size_t>(n_streams) * 65536);
-    DeviceBuffer<double> d_sqs(static_cast<std::size_t>(n_streams) * 65536);
+    DeviceBuffer<dev::MomentPartial> d_moments(
+        static_cast<std::size_t>(n_streams) * 65536);
     for (int c = 0; c < n_streams; ++c) {
         std::size_t begin = static_cast<std::size_t>(c) * chunk;
         if (begin >= paths) continue;
         std::size_t count = std::min(chunk, paths - begin);
         cudaStream_t s = streams[static_cast<std::size_t>(c)];
         int grid = dev::grid_for(count, block_size);
-        std::size_t smem = static_cast<std::size_t>(block_size) * sizeof(double);
-        if (smem < 32 * sizeof(double)) smem = 32 * sizeof(double);
-
         // Per-chunk kernel launched into its own stream; results copied back
         // asynchronously into pinned host memory.
         auto launch = [&](auto real_tag, auto acc_tag) {
             using Real = decltype(real_tag);
             using AccT = decltype(acc_tag);
+            const std::size_t smem =
+                32 * sizeof(dev::RunningMoments<AccT>);
             // Chunk c uses states[begin..]; the kernel indexes 0..count, so a
             // shifted state pointer keeps per-path streams reproducible.
             european_fused_kernel<Real, AccT, 3><<<grid, block_size, smem, s>>>(
                 opt, states.ptr + begin,
-                d_sums.ptr + static_cast<std::size_t>(c) * 65536,
-                d_sqs.ptr + static_cast<std::size_t>(c) * 65536, count);
+                d_moments.ptr + static_cast<std::size_t>(c) * 65536, count);
         };
         if (precision == Precision::Float) launch(float{}, float{});
         else if (precision == Precision::Mixed) launch(float{}, double{});
         else launch(double{}, double{});
 
-        QC_CUDA_CHECK(cudaMemcpyAsync(h_sums + static_cast<std::size_t>(c) * 65536,
-                                      d_sums.ptr + static_cast<std::size_t>(c) * 65536,
-                                      static_cast<std::size_t>(grid) * sizeof(double),
-                                      cudaMemcpyDeviceToHost, s));
-        QC_CUDA_CHECK(cudaMemcpyAsync(h_sqs + static_cast<std::size_t>(c) * 65536,
-                                      d_sqs.ptr + static_cast<std::size_t>(c) * 65536,
-                                      static_cast<std::size_t>(grid) * sizeof(double),
+        QC_CUDA_CHECK(cudaMemcpyAsync(
+                                      h_moments + static_cast<std::size_t>(c) * 65536,
+                                      d_moments.ptr + static_cast<std::size_t>(c) * 65536,
+                                      static_cast<std::size_t>(grid) *
+                                          sizeof(dev::MomentPartial),
                                       cudaMemcpyDeviceToHost, s));
     }
     QC_CUDA_CHECK(cudaGetLastError());
     for (auto& s : streams) QC_CUDA_CHECK(cudaStreamSynchronize(s));
     float kernel_ms = ev.end();
 
-    std::vector<double> all_sums, all_sqs;
+    std::vector<dev::MomentPartial> all_moments;
     for (int c = 0; c < n_streams; ++c) {
         std::size_t begin = static_cast<std::size_t>(c) * chunk;
         if (begin >= paths) continue;
         std::size_t count = std::min(chunk, paths - begin);
         int grid = dev::grid_for(count, block_size);
         for (int g = 0; g < grid; ++g) {
-            all_sums.push_back(h_sums[static_cast<std::size_t>(c) * 65536 +
-                                      static_cast<std::size_t>(g)]);
-            all_sqs.push_back(h_sqs[static_cast<std::size_t>(c) * 65536 +
-                                    static_cast<std::size_t>(g)]);
+            all_moments.push_back(
+                h_moments[static_cast<std::size_t>(c) * 65536 +
+                          static_cast<std::size_t>(g)]);
         }
     }
     GpuMcRun out;
-    out.stats = finalize_partials(all_sums, all_sqs, paths,
+    out.stats = finalize_partials(all_moments, paths,
                                   exp(-opt.rate * opt.maturity));
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
 
     for (auto& s : streams) cudaStreamDestroy(s);
-    cudaFreeHost(h_sums);
-    cudaFreeHost(h_sqs);
+    cudaFreeHost(h_moments);
     return out;
 }
 
@@ -466,8 +462,13 @@ GpuMcRun european_soa_batch_gpu(const std::vector<dev::OptionParams>& batch,
     init_rng(states.ptr, seed, total_paths, block_size, nullptr);
     DeviceBuffer<double> sums(static_cast<std::size_t>(n));
     DeviceBuffer<double> sqs(static_cast<std::size_t>(n));
+    DeviceBuffer<double> centers(static_cast<std::size_t>(n));
     QC_CUDA_CHECK(cudaMemset(sums.ptr, 0, sums.n * sizeof(double)));
     QC_CUDA_CHECK(cudaMemset(sqs.ptr, 0, sqs.n * sizeof(double)));
+    std::vector<double> h_centers(batch.size());
+    for (std::size_t i = 0; i < batch.size(); ++i)
+        h_centers[i] = payoff_center(batch[i]);
+    centers.copy_from(h_centers.data());
 
     DeviceBuffer<char> params_buf;
     DeviceBuffer<double> f_spots, f_strikes, f_rates, f_divs, f_vols, f_mats, f_bars;
@@ -524,10 +525,12 @@ GpuMcRun european_soa_batch_gpu(const std::vector<dev::OptionParams>& batch,
         using Real = decltype(real_tag);
         if (use_aos)
             v1_batch_kernel<Real, true><<<grid, block_size>>>(
-                params_buf.ptr, n, paths_each, states.ptr, sums.ptr, sqs.ptr);
+                params_buf.ptr, n, paths_each, centers.ptr, states.ptr, sums.ptr,
+                sqs.ptr);
         else
             v1_batch_kernel<Real, false><<<grid, block_size>>>(
-                params_buf.ptr, n, paths_each, states.ptr, sums.ptr, sqs.ptr);
+                params_buf.ptr, n, paths_each, centers.ptr, states.ptr, sums.ptr,
+                sqs.ptr);
     };
     if (precision == Precision::Double) launch(double{});
     else launch(float{});
@@ -543,8 +546,8 @@ GpuMcRun european_soa_batch_gpu(const std::vector<dev::OptionParams>& batch,
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
     if (n == 1)
-        out.stats = finalize_partials(
-            h_sums, h_sqs, paths_each,
+        out.stats = finalize_shifted_sums(
+            h_sums[0], h_sqs[0], payoff_center(batch[0]), paths_each,
             exp(-batch[0].rate * batch[0].maturity));
     else
         out.stats.paths = total_paths;

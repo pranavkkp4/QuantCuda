@@ -25,6 +25,20 @@ QC_TEST(correlation, identity_and_single_asset) {
     QC_CHECK_NEAR(L2[0], 1.0, 1e-15);
     QC_CHECK_NEAR(L2[3], 1.0, 1e-15);
     QC_CHECK_NEAR(L2[1], 0.0, 1e-15);
+
+    std::vector<double> in_place = {2.0, -3.0};
+    CorrelationEngine::apply(L2, 2, in_place, in_place);
+    QC_CHECK_NEAR(in_place[0], 2.0, 1e-15);
+    QC_CHECK_NEAR(in_place[1], -3.0, 1e-15);
+
+    // A partial overlap is safe too: output begins one element into the input
+    // allocation and would otherwise overwrite the second independent draw.
+    std::vector<double> partial_overlap = {4.0, 5.0, 0.0};
+    CorrelationEngine::apply(
+        L2, 2, std::span<const double>(partial_overlap.data(), 2),
+        std::span<double>(partial_overlap.data() + 1, 2));
+    QC_CHECK_NEAR(partial_overlap[1], 4.0, 1e-15);
+    QC_CHECK_NEAR(partial_overlap[2], 5.0, 1e-15);
     QC_CHECK_THROWS(CorrelationEngine::cholesky({}));
     QC_CHECK_THROWS(CorrelationEngine::cholesky({{1.0, 0.0}, {0.0}}));
     QC_CHECK_THROWS(CorrelationEngine::cholesky({{std::nan("")}}));

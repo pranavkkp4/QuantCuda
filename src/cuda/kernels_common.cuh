@@ -54,6 +54,59 @@ struct OptionAoS {
     int is_call, barrier_dir, time_steps;
 };
 
+// Mergeable streaming moments used by pricing and Greeks kernels.  Keeping M2
+// (the sum of squared deviations from the running mean) avoids forming the
+// cancellation-prone E[X^2] - E[X]^2 expression.  A thread updates its local
+// moments with Welford's recurrence; blocks and the host combine them with
+// Chan's parallel recurrence.
+template <typename T>
+struct RunningMoments {
+    unsigned long long count = 0;
+    T mean = T(0);
+    T m2 = T(0);
+};
+
+// Type-erased block result copied to the host.  Float-accumulation kernels
+// deliberately do their arithmetic in float, then widen the final partial.
+struct MomentPartial {
+    unsigned long long count = 0;
+    double mean = 0.0;
+    double m2 = 0.0;
+};
+
+template <typename T>
+__host__ __device__ inline void moments_add(RunningMoments<T>& moments, T value) {
+    const unsigned long long next_count = moments.count + 1;
+    const T delta = value - moments.mean;
+    moments.mean += delta / static_cast<T>(next_count);
+    const T delta2 = value - moments.mean;
+    moments.m2 += delta * delta2;
+    moments.count = next_count;
+}
+
+template <typename T>
+__host__ __device__ inline RunningMoments<T> moments_merge(
+    RunningMoments<T> lhs, const RunningMoments<T>& rhs) {
+    if (lhs.count == 0) return rhs;
+    if (rhs.count == 0) return lhs;
+    const unsigned long long combined_count = lhs.count + rhs.count;
+    const T lhs_count = static_cast<T>(lhs.count);
+    const T rhs_count = static_cast<T>(rhs.count);
+    const T combined = static_cast<T>(combined_count);
+    const T delta = rhs.mean - lhs.mean;
+    lhs.mean += delta * (rhs_count / combined);
+    lhs.m2 += rhs.m2 + delta * delta * (lhs_count * (rhs_count / combined));
+    lhs.count = combined_count;
+    return lhs;
+}
+
+template <typename T>
+__host__ __device__ inline MomentPartial moments_partial(
+    const RunningMoments<T>& moments) {
+    return {moments.count, static_cast<double>(moments.mean),
+            static_cast<double>(moments.m2)};
+}
+
 // ---------------------------------------------------------------------------
 // Device math
 // ---------------------------------------------------------------------------
@@ -124,6 +177,55 @@ __device__ AccT block_reduce_warp(AccT v, AccT* smem /* >= 32 slots */) {
     v = (threadIdx.x < nwarps) ? smem[threadIdx.x] : AccT(0);
     if (warp == 0) v = warp_reduce(v);
     if (threadIdx.x == 0) smem[0] = v;
+    __syncthreads();
+    return smem[0];
+}
+
+// Moment-specific reductions use Chan merges instead of scalar addition.
+template <typename T>
+__device__ __forceinline__ RunningMoments<T> warp_reduce_moments(
+    RunningMoments<T> value) {
+    const unsigned mask = __activemask();
+    const int lane = threadIdx.x & 31;
+    const int active_lanes = __popc(mask);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        RunningMoments<T> other;
+        other.count = __shfl_down_sync(mask, value.count, offset);
+        other.mean = __shfl_down_sync(mask, value.mean, offset);
+        other.m2 = __shfl_down_sync(mask, value.m2, offset);
+        if (lane + offset < active_lanes) value = moments_merge(value, other);
+    }
+    return value;
+}
+
+template <typename T>
+__device__ RunningMoments<T> block_reduce_moments_smem(
+    RunningMoments<T> value, RunningMoments<T>* smem) {
+    const int tid = threadIdx.x;
+    smem[tid] = value;
+    __syncthreads();
+    for (int active = blockDim.x; active > 1; active = (active + 1) / 2) {
+        const int next = (active + 1) / 2;
+        if (tid + next < active)
+            smem[tid] = moments_merge(smem[tid], smem[tid + next]);
+        __syncthreads();
+    }
+    return smem[0];
+}
+
+template <typename T>
+__device__ RunningMoments<T> block_reduce_moments_warp(
+    RunningMoments<T> value, RunningMoments<T>* smem /* >= 32 slots */) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    value = warp_reduce_moments(value);
+    if (lane == 0) smem[warp] = value;
+    __syncthreads();
+    const int nwarps = (blockDim.x + 31) >> 5;
+    value = threadIdx.x < nwarps ? smem[threadIdx.x] : RunningMoments<T>{};
+    if (warp == 0) value = warp_reduce_moments(value);
+    if (threadIdx.x == 0) smem[0] = value;
     __syncthreads();
     return smem[0];
 }

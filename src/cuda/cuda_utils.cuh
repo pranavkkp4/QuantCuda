@@ -4,7 +4,6 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
-#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -74,60 +73,74 @@ struct DeviceBuffer {
     }
 };
 
-// Neumaier summation keeps the host-side combination of block partials from
-// needlessly discarding low-order bits. The device still reports sum/sum(x^2),
-// so use an FMA for the centered sum of squares and the unbiased N-1 sample
-// variance expected by the CPU Monte Carlo contract.
-inline double compensated_sum(const std::vector<double>& values) {
-    double sum = 0.0;
-    double correction = 0.0;
-    for (double value : values) {
-        const double next = sum + value;
-        if (std::fabs(sum) >= std::fabs(value))
-            correction += (sum - next) + value;
-        else
-            correction += (value - next) + sum;
-        sum = next;
+inline dev::RunningMoments<double> combine_moment_partials(
+    const std::vector<dev::MomentPartial>& partials) {
+    dev::RunningMoments<double> combined;
+    for (const auto& partial : partials) {
+        const dev::RunningMoments<double> next{partial.count, partial.mean,
+                                                partial.m2};
+        combined = dev::moments_merge(combined, next);
     }
-    return sum + correction;
+    return combined;
 }
 
-inline double stable_centered_sum_squares(double sum, double sq,
-                                          double count) {
-    const double mean = sum / count;
-    double centered = std::fma(-mean, sum, sq);  // sq - sum^2 / n
-    // Raw second moments cannot resolve a variance beneath their rounding
-    // envelope. Treat that envelope as zero instead of reporting numerical
-    // noise as genuine Monte Carlo dispersion.
-    const double roundoff =
-        32.0 * std::numeric_limits<double>::epsilon() *
-        (std::fabs(sq) + std::fabs(mean * sum));
-    if (std::fabs(centered) <= roundoff) centered = 0.0;
-    return std::max(centered, 0.0);
-}
+inline McResult finalize_moments(dev::RunningMoments<double> moments,
+                                 std::size_t expected_paths,
+                                 double discount,
+                                 bool allow_implicit_zeros = false) {
+    if (expected_paths == 0) return McResult{};
+    if (moments.count != expected_paths &&
+        !(allow_implicit_zeros && moments.count < expected_paths))
+        throw std::runtime_error("CUDA moment count does not match path count");
 
-inline McResult finalize_sums(double sum, double sq, std::size_t paths,
-                              double discount) {
-    if (paths == 0) return McResult{};
-    const double n = static_cast<double>(paths);
-    const double mean = sum / n;
-    const double centered_sq = stable_centered_sum_squares(sum, sq, n);
-    const double var = paths > 1 ? centered_sq / (n - 1.0) : 0.0;
+    // Compacted barrier kernels only emit surviving payoffs. Merge the omitted
+    // knocked-out paths as a zero-valued group so both mean and M2 use all paths.
+    if (moments.count < expected_paths) {
+        const dev::RunningMoments<double> zeros{
+            static_cast<unsigned long long>(expected_paths - moments.count),
+            0.0, 0.0};
+        moments = dev::moments_merge(moments, zeros);
+    }
+
+    const double n = static_cast<double>(expected_paths);
+    const double m2 = std::max(moments.m2, 0.0);
+    const double var = expected_paths > 1 ? m2 / (n - 1.0) : 0.0;
     McResult r;
-    r.mean_payoff = mean;
-    r.price = discount * mean;
+    r.mean_payoff = moments.mean;
+    r.price = discount * moments.mean;
     r.variance = var * discount * discount;
     r.std_error = std::sqrt(r.variance / n);
-    r.paths = paths;
+    r.paths = expected_paths;
     return r;
 }
 
-// Finalize partial block sums into an McResult (host side, deterministic).
-inline McResult finalize_partials(const std::vector<double>& block_sums,
-                                  const std::vector<double>& block_sq_sums,
-                                  std::size_t paths, double discount) {
-    return finalize_sums(compensated_sum(block_sums),
-                         compensated_sum(block_sq_sums), paths, discount);
+// Finalize partial block moments into an McResult (host side, deterministic).
+inline McResult finalize_partials(const std::vector<dev::MomentPartial>& partials,
+                                  std::size_t paths, double discount,
+                                  bool allow_implicit_zeros = false) {
+    return finalize_moments(combine_moment_partials(partials), paths, discount,
+                            allow_implicit_zeros);
+}
+
+// V0 and V1 intentionally retain per-thread global atomics for their benchmark
+// identity. They accumulate x-center and (x-center)^2 around the analytic
+// expected European payoff supplied by the host. Unlike raw x/x^2 moments,
+// this remains well conditioned for, e.g., payoffs near 1e16 with 1e9 spread.
+inline McResult finalize_shifted_sums(double shifted_sum,
+                                      double shifted_sq_sum, double center,
+                                      std::size_t paths, double discount) {
+    if (paths == 0) return McResult{};
+    const double n = static_cast<double>(paths);
+    const double shifted_mean = shifted_sum / n;
+    double m2 = std::fma(-shifted_mean, shifted_sum, shifted_sq_sum);
+    const double roundoff =
+        32.0 * std::numeric_limits<double>::epsilon() *
+        (std::fabs(shifted_sq_sum) + std::fabs(shifted_mean * shifted_sum));
+    if (std::fabs(m2) <= roundoff) m2 = 0.0;
+    dev::RunningMoments<double> moments{
+        static_cast<unsigned long long>(paths), center + shifted_mean,
+        std::max(m2, 0.0)};
+    return finalize_moments(moments, paths, discount);
 }
 
 }  // namespace quantcuda::gpu

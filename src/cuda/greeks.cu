@@ -12,10 +12,10 @@
 namespace quantcuda::gpu {
 namespace {
 
-// Five accumulators per block.
+// Five mergeable moment sets per block. Besides making the price SE stable,
+// their means avoid needlessly summing large bumped payoffs on the host.
 struct GreekPartials {
-    double dn, base, up, vol_dn, vol_up;
-    double sq_base;  // for the price standard error
+    dev::MomentPartial dn, base, up, vol_dn, vol_up;
 };
 
 template <typename Real>
@@ -52,40 +52,45 @@ __global__ void greeks_crn_kernel(dev::OptionParams opt, Real h, Real h_sigma,
     Real diff_vu = dev::gbm_diffusion<Real>(sig + h_sigma, T);
     Real diff_vd = dev::gbm_diffusion<Real>(sig_dn, T);
 
-    double dn = 0, base = 0, up = 0, vdn = 0, vup = 0, sq = 0;
+    dev::RunningMoments<double> dn, base, up, vdn, vup;
     std::size_t stride = dev::grid_stride();
     for (std::size_t i = dev::global_thread_id(); i < path_count; i += stride) {
         curandStatePhilox4_32_10_t state = states[i];
         Real z = draw_normal_g<Real>(&state);  // ONE draw prices all five points
         double pb = static_cast<double>(payoff_at(opt.is_call, s0, k, drift, diff, z));
-        dn += static_cast<double>(payoff_at(opt.is_call, s0 - h, k, drift, diff, z));
-        base += pb;
-        up += static_cast<double>(payoff_at(opt.is_call, s0 + h, k, drift, diff, z));
-        vdn += static_cast<double>(payoff_at(opt.is_call, s0, k, drift_vd, diff_vd, z));
-        vup += static_cast<double>(payoff_at(opt.is_call, s0, k, drift_vu, diff_vu, z));
-        sq += pb * pb;
+        dev::moments_add(
+            dn, static_cast<double>(payoff_at(opt.is_call, s0 - h, k, drift, diff, z)));
+        dev::moments_add(base, pb);
+        dev::moments_add(
+            up, static_cast<double>(payoff_at(opt.is_call, s0 + h, k, drift, diff, z)));
+        dev::moments_add(
+            vdn, static_cast<double>(payoff_at(opt.is_call, s0, k, drift_vd, diff_vd, z)));
+        dev::moments_add(
+            vup, static_cast<double>(payoff_at(opt.is_call, s0, k, drift_vu, diff_vu, z)));
     }
-    extern __shared__ double red[];
-    double t_dn = dev::block_reduce_warp(dn, red);
+    extern __shared__ char smem_raw[];
+    auto* red = reinterpret_cast<dev::RunningMoments<double>*>(smem_raw);
+    const auto t_dn = dev::block_reduce_moments_warp(dn, red);
     __syncthreads();
-    double t_base = dev::block_reduce_warp(base, red);
+    const auto t_base = dev::block_reduce_moments_warp(base, red);
     __syncthreads();
-    double t_up = dev::block_reduce_warp(up, red);
+    const auto t_up = dev::block_reduce_moments_warp(up, red);
     __syncthreads();
-    double t_vdn = dev::block_reduce_warp(vdn, red);
+    const auto t_vdn = dev::block_reduce_moments_warp(vdn, red);
     __syncthreads();
-    double t_vup = dev::block_reduce_warp(vup, red);
-    __syncthreads();
-    double t_sq = dev::block_reduce_warp(sq, red);
+    const auto t_vup = dev::block_reduce_moments_warp(vup, red);
     if (threadIdx.x == 0) {
-        block_out[blockIdx.x] = {t_dn, t_base, t_up, t_vdn, t_vup, t_sq};
+        block_out[blockIdx.x] = {
+            dev::moments_partial(t_dn), dev::moments_partial(t_base),
+            dev::moments_partial(t_up), dev::moments_partial(t_vdn),
+            dev::moments_partial(t_vup)};
     }
 }
 
 template <typename Real>
 __global__ void pathwise_delta_kernel(dev::OptionParams opt,
                                       curandStatePhilox4_32_10_t* states,
-                                      double* block_sums, double* block_sq_sums,
+                                      dev::MomentPartial* block_moments,
                                       std::size_t path_count) {
     Real drift = dev::gbm_drift<Real>(static_cast<Real>(opt.rate),
                                       static_cast<Real>(opt.dividend),
@@ -95,7 +100,7 @@ __global__ void pathwise_delta_kernel(dev::OptionParams opt,
                                          static_cast<Real>(opt.maturity));
     Real k = static_cast<Real>(opt.strike);
     Real s0 = static_cast<Real>(opt.spot);
-    double sum = 0, sq = 0;
+    dev::RunningMoments<double> moments;
     std::size_t stride = dev::grid_stride();
     for (std::size_t i = dev::global_thread_id(); i < path_count; i += stride) {
         curandStatePhilox4_32_10_t state = states[i];
@@ -103,17 +108,12 @@ __global__ void pathwise_delta_kernel(dev::OptionParams opt,
         bool itm = opt.is_call ? (st > k) : (st < k);
         double c = itm ? static_cast<double>(st / s0) * (opt.is_call ? 1.0 : -1.0)
                        : 0.0;
-        sum += c;
-        sq += c * c;
+        dev::moments_add(moments, c);
     }
-    extern __shared__ double red2[];
-    double ts = dev::block_reduce_warp(sum, red2);
-    __syncthreads();
-    double tq = dev::block_reduce_warp(sq, red2);
-    if (threadIdx.x == 0) {
-        block_sums[blockIdx.x] = ts;
-        block_sq_sums[blockIdx.x] = tq;
-    }
+    extern __shared__ char smem_raw[];
+    auto* red = reinterpret_cast<dev::RunningMoments<double>*>(smem_raw);
+    const auto total = dev::block_reduce_moments_warp(moments, red);
+    if (threadIdx.x == 0) block_moments[blockIdx.x] = dev::moments_partial(total);
 }
 
 }  // namespace
@@ -129,8 +129,7 @@ GpuGreeksRun greeks_crn_gpu(const dev::OptionParams& opt, std::size_t paths,
     QC_CUDA_CHECK(cudaDeviceSynchronize());
 
     EventTimer ev;
-    std::size_t smem = static_cast<std::size_t>(block_size) * sizeof(double);
-    if (smem < 32 * sizeof(double)) smem = 32 * sizeof(double);
+    std::size_t smem = 32 * sizeof(dev::RunningMoments<double>);
     ev.begin();
     greeks_crn_kernel<double><<<grid, block_size, smem>>>(
         opt, h, h_sigma, states.ptr, partials.ptr, paths);
@@ -141,25 +140,38 @@ GpuGreeksRun greeks_crn_gpu(const dev::OptionParams& opt, std::size_t paths,
     QC_CUDA_CHECK(cudaMemcpy(host_parts.data(), partials.ptr,
                              host_parts.size() * sizeof(GreekPartials),
                              cudaMemcpyDeviceToHost));
-    double dn = 0, base = 0, up = 0, vdn = 0, vup = 0, sq = 0;
+    dev::RunningMoments<double> dn, base, up, vdn, vup;
+    auto merge_partial = [](dev::RunningMoments<double>& total,
+                            const dev::MomentPartial& partial) {
+        total = dev::moments_merge(
+            total, dev::RunningMoments<double>{partial.count, partial.mean,
+                                                partial.m2});
+    };
     for (const auto& p : host_parts) {
-        dn += p.dn; base += p.base; up += p.up;
-        vdn += p.vol_dn; vup += p.vol_up; sq += p.sq_base;
+        merge_partial(dn, p.dn);
+        merge_partial(base, p.base);
+        merge_partial(up, p.up);
+        merge_partial(vdn, p.vol_dn);
+        merge_partial(vup, p.vol_up);
     }
-    double n = static_cast<double>(paths);
     double df = exp(-opt.rate * opt.maturity);
     GpuGreeksRun out;
-    double mean = base / n;
-    const double centered_sq = stable_centered_sum_squares(base, sq, n);
-    const double var = paths > 1 ? centered_sq / (n - 1.0) : 0.0;
-    out.price = df * mean;
-    out.price_se = df * sqrt(var / n);
-    out.delta = df * (up / n - dn / n) / (2.0 * h);
-    out.gamma = df * (up / n - 2.0 * base / n + dn / n) / (h * h);
+    const McResult dn_stats = finalize_moments(dn, paths, 1.0);
+    const McResult base_stats = finalize_moments(base, paths, df);
+    const McResult up_stats = finalize_moments(up, paths, 1.0);
+    const McResult vdn_stats = finalize_moments(vdn, paths, 1.0);
+    const McResult vup_stats = finalize_moments(vup, paths, 1.0);
+    out.price = base_stats.price;
+    out.price_se = base_stats.std_error;
+    out.delta = df * (up_stats.mean_payoff - dn_stats.mean_payoff) / (2.0 * h);
+    out.gamma = df * (up_stats.mean_payoff -
+                      2.0 * base_stats.mean_payoff + dn_stats.mean_payoff) /
+                (h * h);
     const double vega_denominator = opt.volatility >= h_sigma
                                         ? 2.0 * h_sigma
                                         : h_sigma;
-    out.vega = df * (vup / n - vdn / n) / vega_denominator;
+    out.vega = df * (vup_stats.mean_payoff - vdn_stats.mean_payoff) /
+               vega_denominator;
     out.kernel_ms = kernel_ms;
     return out;
 }
@@ -170,25 +182,21 @@ GpuMcRun delta_pathwise_gpu(const dev::OptionParams& opt, std::size_t paths,
     if (paths == 0) return GpuMcRun{};
     DeviceBuffer<curandStatePhilox4_32_10_t> states(paths);
     int grid = dev::grid_for(paths, block_size);
-    DeviceBuffer<double> sums(static_cast<std::size_t>(grid));
-    DeviceBuffer<double> sqs(static_cast<std::size_t>(grid));
+    DeviceBuffer<dev::MomentPartial> moments(static_cast<std::size_t>(grid));
     init_rng(states.ptr, seed, paths, block_size, nullptr);
     QC_CUDA_CHECK(cudaDeviceSynchronize());
     EventTimer ev;
-    std::size_t smem = static_cast<std::size_t>(block_size) * sizeof(double);
-    if (smem < 32 * sizeof(double)) smem = 32 * sizeof(double);
+    std::size_t smem = 32 * sizeof(dev::RunningMoments<double>);
     ev.begin();
     pathwise_delta_kernel<double><<<grid, block_size, smem>>>(
-        opt, states.ptr, sums.ptr, sqs.ptr, paths);
+        opt, states.ptr, moments.ptr, paths);
     QC_CUDA_CHECK(cudaGetLastError());
     float kernel_ms = ev.end();
-    std::vector<double> h_sums(static_cast<std::size_t>(grid));
-    std::vector<double> h_sqs(static_cast<std::size_t>(grid));
-    sums.copy_to(h_sums.data());
-    sqs.copy_to(h_sqs.data());
+    std::vector<dev::MomentPartial> h_moments(static_cast<std::size_t>(grid));
+    moments.copy_to(h_moments.data());
     QC_CUDA_CHECK(cudaDeviceSynchronize());
     GpuMcRun out;
-    out.stats = finalize_partials(h_sums, h_sqs, paths, exp(-opt.rate * opt.maturity));
+    out.stats = finalize_partials(h_moments, paths, exp(-opt.rate * opt.maturity));
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
     return out;

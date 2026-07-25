@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -78,6 +79,22 @@ public:
         if (z_indep.size() != d || z_corr.size() != d)
             throw std::invalid_argument(
                 "correlation apply: input and output sizes must equal dimension");
+
+        // Snapshot only when the spans overlap. Otherwise writing an early
+        // output component can clobber an independent draw needed by a later
+        // row of L. std::less provides a total order even for pointers into
+        // different allocations; the usual disjoint-buffer path stays
+        // allocation-free.
+        const double* input_begin = z_indep.data();
+        const double* input_end = input_begin + d;
+        const double* output_begin = z_corr.data();
+        const double* output_end = output_begin + d;
+        const std::less<const double*> before;
+        std::vector<double> input_copy;
+        if (before(input_begin, output_end) && before(output_begin, input_end)) {
+            input_copy.assign(z_indep.begin(), z_indep.end());
+            z_indep = std::span<const double>(input_copy);
+        }
         for (std::size_t i = 0; i < d; ++i) {
             double sum = 0.0;
             for (std::size_t k = 0; k <= i; ++k) sum += L[i * d + k] * z_indep[k];

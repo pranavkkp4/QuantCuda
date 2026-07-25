@@ -73,6 +73,14 @@ QC_TEST(cpu_gpu_agreement, gpu_path_types_match_cpu_when_built) {
     McResult b_gpu = gpu::price_barrier(bo, 100.0, 0.05, 0.0, 0.25, cfg, 0);
     QC_CHECK(std::fabs(b_cpu.price - b_gpu.price) <
              4.0 * std::hypot(b_cpu.std_error, b_gpu.std_error));
+    const McResult b_mask =
+        gpu::price_barrier(bo, 100.0, 0.05, 0.0, 0.25, cfg, 1);
+    const McResult b_compacted =
+        gpu::price_barrier(bo, 100.0, 0.05, 0.0, 0.25, cfg, 2);
+    QC_CHECK_NEAR(b_mask.price, b_gpu.price, 1e-9);
+    QC_CHECK_NEAR(b_mask.std_error, b_gpu.std_error, 1e-9);
+    QC_CHECK_NEAR(b_compacted.price, b_gpu.price, 1e-9);
+    QC_CHECK_NEAR(b_compacted.std_error, b_gpu.std_error, 1e-9);
     OptionSpec breached = bo;
     breached.barrier = 95.0;
     McResult knocked_out =
@@ -93,14 +101,46 @@ QC_TEST(cpu_gpu_agreement, gpu_path_types_match_cpu_when_built) {
         gpu::price_greeks_european(low_vol, 100.0, 0.04, 0.0, 0.005, cfg);
     QC_CHECK_NEAR(gpu_low_vol.greeks.vega, cpu_low_vol.greeks.vega, 2.0);
 
-    // Raw second moments are numerically unresolved for very large constant
-    // payoffs; the GPU finalizer must not report roundoff as real variance.
+    // A zero-spread payoff at a very large location remains exactly constant.
     OptionSpec deterministic = low_vol;
     deterministic.strike = 0.0;
     McResult stable =
         gpu::price_european(deterministic, 1.0e16, 0.0, 0.0, 0.0, cfg);
     QC_CHECK_NEAR(stable.price, 1.0e16, 16.0);
     QC_CHECK_NEAR(stable.std_error, 0.0, 0.0);
+
+    // Genuine small variance at a large location: S_T is centered near 1e16
+    // with standard deviation about 1e9. Raw sum/sum(x^2) accumulation loses
+    // material digits here; every preserved GPU generation must recover the
+    // analytic lognormal standard error with shifted or Welford/Chan moments.
+    constexpr double tiny_vol = 1.0e-7;
+    const double expected_se =
+        1.0e16 * std::sqrt(std::expm1(tiny_vol * tiny_vol)) /
+        std::sqrt(static_cast<double>(cfg.paths));
+    const GpuVersion versions[] = {
+        GpuVersion::V0_Naive, GpuVersion::V1_SoA,
+        GpuVersion::V2_Fused, GpuVersion::V3_Reduction,
+        GpuVersion::V4_Specialized, GpuVersion::V5_Memory,
+        GpuVersion::V6_Async, GpuVersion::V7_Precision};
+    for (GpuVersion version : versions) {
+        cfg.gpu_version = version;
+        const McResult dispersed = gpu::price_european(
+            deterministic, 1.0e16, 0.05, 0.0, tiny_vol, cfg);
+        QC_CHECK(std::isfinite(dispersed.std_error));
+        QC_CHECK_NEAR(dispersed.std_error, expected_se, 0.03 * expected_se);
+    }
+    cfg.gpu_version = GpuVersion::V7_Precision;
+    const McGreeksResult dispersed_greeks = gpu::price_greeks_european(
+        deterministic, 1.0e16, 0.0, 0.0, tiny_vol, cfg);
+    QC_CHECK_NEAR(dispersed_greeks.price_std_error, expected_se,
+                  0.03 * expected_se);
+    const McResult dispersed_pathwise = gpu::delta_pathwise_european(
+        deterministic, 1.0e16, 0.0, 0.0, tiny_vol, cfg);
+    const double expected_pathwise_se =
+        std::sqrt(std::expm1(tiny_vol * tiny_vol)) /
+        std::sqrt(static_cast<double>(cfg.paths));
+    QC_CHECK_NEAR(dispersed_pathwise.std_error, expected_pathwise_se,
+                  0.03 * expected_pathwise_se);
 
     // Exercise the correlated-scenario and portfolio-risk kernels too; these
     // previously had no GPU regression coverage.
