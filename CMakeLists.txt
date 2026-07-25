@@ -40,13 +40,18 @@ if(QUANTCUDA_ENABLE_CUDA)
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
+        # Set the project default before enable_language(); otherwise CMake
+        # installs nvcc's single implicit architecture in the cache first and
+        # the documented multi-architecture default never takes effect.
+        # A caller-provided -DCMAKE_CUDA_ARCHITECTURES value remains authoritative.
+        if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+            set(CMAKE_CUDA_ARCHITECTURES "75;86;89;90" CACHE STRING
+                "CUDA architectures")
+        endif()
         enable_language(CUDA)
         find_package(CUDAToolkit REQUIRED)
         set(QUANTCUDA_HAS_CUDA TRUE)
         # RTX 3050 = sm_86. Default covers Turing/Ampere/Ada/Hopper.
-        if(NOT CMAKE_CUDA_ARCHITECTURES)
-            set(CMAKE_CUDA_ARCHITECTURES "75;86;89;90" CACHE STRING "CUDA architectures" FORCE)
-        endif()
         set(CMAKE_CUDA_STANDARD 20)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         message(STATUS "QuantCUDA: CUDA toolkit found (${CMAKE_CUDA_COMPILER_VERSION}), "
