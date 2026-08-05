@@ -31,6 +31,22 @@ ncu --set full \
       --backend cuda --paths 10000000 --gpu-version v2
 ```
 
+### Windows counter-access preflight
+
+Nsight Compute needs access to the GPU performance counters. If the command
+returns `ERR_NVGPUCTRPERM`, either run the profiler from an elevated terminal
+or enable access for all users in **NVIDIA Control Panel**: **Desktop** >
+**Enable Developer Settings**, then **Developer** > **Manage GPU Performance
+Counters**. This is a machine policy, not an application error. See NVIDIA's
+[official remediation guidance](https://developer.nvidia.com/nvidia-development-tools-solutions-ERR_NVGPUCTRPERM-permission-issue-performance-counters).
+
+For a short, focused collection of the fused European kernel's throughput,
+occupancy, and scheduler/warp-stall sections:
+
+```powershell
+ncu --target-processes all --section SpeedOfLight --section Occupancy --section SchedulerStats --kernel-name "regex:european_fused_kernel" --launch-count 1 .\build-gpu\quantcuda.exe price --portfolio configs\european_call.json --backend cuda --paths 250000 --gpu-version v7
+```
+
 PowerShell / Visual Studio build:
 
 ```powershell

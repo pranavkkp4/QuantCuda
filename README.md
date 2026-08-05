@@ -300,6 +300,11 @@ python3 scripts/generate_portfolio.py --assets 4 --european 100 \
     --asian 50 --barrier 20 --output configs/generated_portfolio.json
 ```
 
+These model-validation workloads do not require a downloaded market dataset:
+the GBM inputs are explicit and European results are checked against the
+Black-Scholes closed form. See `docs/data_provenance.md` for the rationale and
+fully reproducible data-generation commands.
+
 ## GPU implementation generations V0–V7
 
 | Version | One-line description | Select |
@@ -349,6 +354,13 @@ stdout reports, and an environment block. `convergence` is an accuracy sweep,
 so its rows report price, standard error, and absolute error rather than timing
 quantiles. Workload sizes are overridable (`--paths`, `--steps`,
 `--instruments`, `--scenarios`).
+
+Recreate the canonical CPU convergence CSV and run the accuracy analysis with
+one cross-platform command (defaults to the scalar backend and seed 42):
+
+```bash
+python3 scripts/collect_cpu_validation.py
+```
 
 ## Testing
 
@@ -424,6 +436,7 @@ quantcuda-risk-engine/
 | `docs/correctness_report.md` | test results + validation tables (real outputs) |
 | `docs/performance_report.md` | measured CPU/GPU results for all nine suites, optimization conclusions, timing caveats |
 | `docs/test_plan.md` | QA strategy, coverage, quality gates |
+| `docs/data_provenance.md` | no-download rationale, synthetic inputs, reproducible validation CSV collection |
 | `docs/security_review.md` | OWASP Top-10 review of the codebase |
 | `profiling/README.md` | Nsight Compute/Systems capture workflows |
 

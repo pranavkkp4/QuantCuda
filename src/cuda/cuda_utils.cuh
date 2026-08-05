@@ -43,6 +43,72 @@ struct EventTimer {
     }
 };
 
+// Small owning wrappers used by the multi-stream path.  They make error paths
+// safe: a failed launch or copy must not leak streams, events, or page-locked
+// memory into the long-running CLI process.
+struct CudaStream {
+    cudaStream_t handle = nullptr;
+    CudaStream() { QC_CUDA_CHECK(cudaStreamCreate(&handle)); }
+    ~CudaStream() {
+        if (handle) cudaStreamDestroy(handle);
+    }
+    CudaStream(const CudaStream&) = delete;
+    CudaStream& operator=(const CudaStream&) = delete;
+    CudaStream(CudaStream&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+    CudaStream& operator=(CudaStream&& other) noexcept {
+        if (this != &other) {
+            if (handle) cudaStreamDestroy(handle);
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+};
+
+struct CudaEvent {
+    cudaEvent_t handle = nullptr;
+    CudaEvent() { QC_CUDA_CHECK(cudaEventCreate(&handle)); }
+    ~CudaEvent() {
+        if (handle) cudaEventDestroy(handle);
+    }
+    CudaEvent(const CudaEvent&) = delete;
+    CudaEvent& operator=(const CudaEvent&) = delete;
+    CudaEvent(CudaEvent&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+    CudaEvent& operator=(CudaEvent&& other) noexcept {
+        if (this != &other) {
+            if (handle) cudaEventDestroy(handle);
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+    void record(cudaStream_t stream) { QC_CUDA_CHECK(cudaEventRecord(handle, stream)); }
+    float elapsed_since(const CudaEvent& start) const {
+        float ms = 0.0f;
+        QC_CUDA_CHECK(cudaEventElapsedTime(&ms, start.handle, handle));
+        return ms;
+    }
+};
+
+template <typename T>
+struct PinnedHostBuffer {
+    T* ptr = nullptr;
+    std::size_t n = 0;
+    explicit PinnedHostBuffer(std::size_t count) : n(count) {
+        if (n > 0)
+            QC_CUDA_CHECK(cudaHostAlloc(&ptr, n * sizeof(T), cudaHostAllocDefault));
+    }
+    ~PinnedHostBuffer() {
+        if (ptr) cudaFreeHost(ptr);
+    }
+    PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+};
+
 // RAII device buffer.
 template <typename T>
 struct DeviceBuffer {

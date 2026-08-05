@@ -374,27 +374,26 @@ GpuMcRun european_async_gpu(const dev::OptionParams& opt, std::size_t paths,
     std::size_t chunk = (paths + static_cast<std::size_t>(n_streams) - 1) /
                         static_cast<std::size_t>(n_streams);
 
-    // Pinned host buffers for async transfers.
-    dev::MomentPartial* h_moments = nullptr;
-    QC_CUDA_CHECK(cudaHostAlloc(&h_moments, static_cast<std::size_t>(n_streams) *
-                                            65536 * sizeof(dev::MomentPartial),
-                                cudaHostAllocDefault));
-
-    std::vector<cudaStream_t> streams(static_cast<std::size_t>(n_streams));
-    for (auto& s : streams) QC_CUDA_CHECK(cudaStreamCreate(&s));
+    // Pinned host buffers allow the result copies to overlap subsequent
+    // chunks.  The wrappers also clean up correctly if an allocation or
+    // launch fails part-way through setup.
+    constexpr std::size_t kMaxBlocksPerChunk = 65536;
+    PinnedHostBuffer<dev::MomentPartial> h_moments(
+        static_cast<std::size_t>(n_streams) * kMaxBlocksPerChunk);
+    std::vector<CudaStream> streams(static_cast<std::size_t>(n_streams));
+    std::vector<CudaEvent> kernel_starts(static_cast<std::size_t>(n_streams));
+    std::vector<CudaEvent> kernel_stops(static_cast<std::size_t>(n_streams));
 
     DeviceBuffer<curandStatePhilox4_32_10_t> states(paths);
     init_rng(states.ptr, seed, paths, block_size, nullptr);
 
-    EventTimer ev;
-    ev.begin();
     DeviceBuffer<dev::MomentPartial> d_moments(
-        static_cast<std::size_t>(n_streams) * 65536);
+        static_cast<std::size_t>(n_streams) * kMaxBlocksPerChunk);
     for (int c = 0; c < n_streams; ++c) {
         std::size_t begin = static_cast<std::size_t>(c) * chunk;
         if (begin >= paths) continue;
         std::size_t count = std::min(chunk, paths - begin);
-        cudaStream_t s = streams[static_cast<std::size_t>(c)];
+        cudaStream_t s = streams[static_cast<std::size_t>(c)].handle;
         int grid = dev::grid_for(count, block_size);
         // Per-chunk kernel launched into its own stream; results copied back
         // asynchronously into pinned host memory.
@@ -407,22 +406,39 @@ GpuMcRun european_async_gpu(const dev::OptionParams& opt, std::size_t paths,
             // shifted state pointer keeps per-path streams reproducible.
             european_fused_kernel<Real, AccT, 3><<<grid, block_size, smem, s>>>(
                 opt, states.ptr + begin,
-                d_moments.ptr + static_cast<std::size_t>(c) * 65536, count);
+                d_moments.ptr + static_cast<std::size_t>(c) *
+                                    kMaxBlocksPerChunk,
+                count);
         };
+        kernel_starts[static_cast<std::size_t>(c)].record(s);
         if (precision == Precision::Float) launch(float{}, float{});
         else if (precision == Precision::Mixed) launch(float{}, double{});
         else launch(double{}, double{});
+        QC_CUDA_CHECK(cudaGetLastError());
+        kernel_stops[static_cast<std::size_t>(c)].record(s);
 
         QC_CUDA_CHECK(cudaMemcpyAsync(
-                                      h_moments + static_cast<std::size_t>(c) * 65536,
-                                      d_moments.ptr + static_cast<std::size_t>(c) * 65536,
+                                      h_moments.ptr + static_cast<std::size_t>(c) *
+                                                          kMaxBlocksPerChunk,
+                                      d_moments.ptr + static_cast<std::size_t>(c) *
+                                                          kMaxBlocksPerChunk,
                                       static_cast<std::size_t>(grid) *
                                           sizeof(dev::MomentPartial),
                                       cudaMemcpyDeviceToHost, s));
     }
-    QC_CUDA_CHECK(cudaGetLastError());
-    for (auto& s : streams) QC_CUDA_CHECK(cudaStreamSynchronize(s));
-    float kernel_ms = ev.end();
+    for (auto& s : streams) QC_CUDA_CHECK(cudaStreamSynchronize(s.handle));
+    // Each pair is recorded in the same stream, so this is the longest
+    // per-stream kernel duration (not a wall-clock makespan across streams).
+    // D2H copies are deliberately excluded; they remain in end-to-end time.
+    float kernel_ms = 0.0f;
+    for (int c = 0; c < n_streams; ++c) {
+        const std::size_t begin = static_cast<std::size_t>(c) * chunk;
+        if (begin < paths)
+            kernel_ms = std::max(
+                kernel_ms,
+                kernel_stops[static_cast<std::size_t>(c)].elapsed_since(
+                    kernel_starts[static_cast<std::size_t>(c)]));
+    }
 
     std::vector<dev::MomentPartial> all_moments;
     for (int c = 0; c < n_streams; ++c) {
@@ -432,7 +448,7 @@ GpuMcRun european_async_gpu(const dev::OptionParams& opt, std::size_t paths,
         int grid = dev::grid_for(count, block_size);
         for (int g = 0; g < grid; ++g) {
             all_moments.push_back(
-                h_moments[static_cast<std::size_t>(c) * 65536 +
+                h_moments.ptr[static_cast<std::size_t>(c) * kMaxBlocksPerChunk +
                           static_cast<std::size_t>(g)]);
         }
     }
@@ -442,8 +458,6 @@ GpuMcRun european_async_gpu(const dev::OptionParams& opt, std::size_t paths,
     out.kernel_ms = kernel_ms;
     out.e2e_ms = wall.elapsed_ms();
 
-    for (auto& s : streams) cudaStreamDestroy(s);
-    cudaFreeHost(h_moments);
     return out;
 }
 
