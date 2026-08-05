@@ -40,6 +40,28 @@ QC_TEST(monte_carlo, scalar_openmp_agreement) {
     McResult b = OpenMpMonteCarloPricer::price(o, S0, R, Q, V, cfg);
     // Per-path draws identical; only reduction order differs.
     QC_CHECK_NEAR(a.price, b.price, 1e-10);
+
+    // The same schedule-independent stream contract also covers paths with
+    // many draws and barrier early exits, not just one-draw Europeans.
+    cfg.paths = 20'000;
+    cfg.time_steps = 24;
+    OptionSpec asian;
+    asian.type = OptionType::AsianPut;
+    asian.strike = K;
+    asian.maturity = T;
+    McResult asian_scalar = CpuMonteCarloPricer::price(asian, S0, R, Q, V, cfg);
+    McResult asian_openmp = OpenMpMonteCarloPricer::price(asian, S0, R, Q, V, cfg);
+    QC_CHECK_NEAR(asian_scalar.price, asian_openmp.price, 1e-10);
+
+    OptionSpec barrier;
+    barrier.type = OptionType::BarrierUpOutCall;
+    barrier.strike = K;
+    barrier.barrier = 125.0;
+    barrier.maturity = T;
+    McResult barrier_scalar = CpuMonteCarloPricer::price(barrier, S0, R, Q, V, cfg);
+    McResult barrier_openmp = OpenMpMonteCarloPricer::price(
+        barrier, S0, R, Q, V, cfg, BarrierCheckMode::EarlyExit);
+    QC_CHECK_NEAR(barrier_scalar.price, barrier_openmp.price, 1e-10);
 }
 
 QC_TEST(monte_carlo, openmp_thread_count_invariance) {

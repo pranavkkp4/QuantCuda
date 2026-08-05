@@ -72,6 +72,13 @@ QC_TEST(black_scholes, invalid_inputs_throw) {
     QC_CHECK_THROWS(BlackScholesPricer::call(100.0, -5.0, 0.05, 0.0, 0.2, 1.0));
     QC_CHECK_THROWS(BlackScholesPricer::call(100.0, 100.0, 0.05, 0.0, -0.2, 1.0));
     QC_CHECK_THROWS(BlackScholesPricer::call(100.0, 100.0, 0.05, 0.0, 0.2, -1.0));
+    // The analytic benchmark is only valid for European payoffs. Silently
+    // treating a path-dependent enum as vanilla would produce a plausible but
+    // mathematically invalid validation reference.
+    QC_CHECK_THROWS(BlackScholesPricer::price(
+        OptionType::AsianCall, 100.0, 100.0, 0.05, 0.0, 0.2, 1.0));
+    QC_CHECK_THROWS(BlackScholesPricer::greeks(
+        OptionType::BarrierUpOutCall, 100.0, 100.0, 0.05, 0.0, 0.2, 1.0));
 }
 
 QC_TEST(black_scholes, deep_itm_otm_limits) {

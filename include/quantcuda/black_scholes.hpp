@@ -46,6 +46,7 @@ public:
 
     static double price(OptionType t, double S, double K, double r, double q,
                         double sigma, double T) {
+        validate_option_type(t);
         validate_inputs(S, K, sigma, T, r, q);
         if (T <= 0.0)    return european_payoff(t, S, K);  // at maturity: intrinsic
         if (S == 0.0)    return s0_zero_value(t, K, r, T);
@@ -71,6 +72,7 @@ public:
 
     static Greeks greeks(OptionType t, double S, double K, double r, double q,
                          double sigma, double T) {
+        validate_option_type(t);
         validate_inputs(S, K, sigma, T, r, q);
         Greeks g;
         if (T <= 0.0) {
@@ -119,6 +121,12 @@ public:
     }
 
 private:
+    static void validate_option_type(OptionType t) {
+        if (!is_european(t))
+            throw std::invalid_argument(
+                "BlackScholes: option type must be European call or put");
+    }
+
     static void validate_inputs(double S, double K, double sigma, double T,
                                 double r = 0.0, double q = 0.0) {
         if (!std::isfinite(S) || !std::isfinite(K) || !std::isfinite(r) ||
