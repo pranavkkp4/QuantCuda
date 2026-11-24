@@ -138,6 +138,7 @@ __device__ __forceinline__ Real european_payoff_d(int is_call, Real st, Real k) 
 // ---------------------------------------------------------------------------
 template <typename AccT>
 __device__ __forceinline__ AccT warp_reduce(AccT v) {
+    __syncwarp();
     const unsigned mask = __activemask();
     const int lane = threadIdx.x & 31;
     const int active_lanes = __popc(mask);
@@ -185,6 +186,7 @@ __device__ AccT block_reduce_warp(AccT v, AccT* smem /* >= 32 slots */) {
 template <typename T>
 __device__ __forceinline__ RunningMoments<T> warp_reduce_moments(
     RunningMoments<T> value) {
+    __syncwarp();
     const unsigned mask = __activemask();
     const int lane = threadIdx.x & 31;
     const int active_lanes = __popc(mask);
